@@ -1,5 +1,4 @@
-// app/api/chat/route.ts
-import { streamText, tool, stepCountIs, toolCallCountIs } from 'ai'
+import { streamText, tool } from 'ai'
 import { openai } from '@ai-sdk/openai'
 import { z } from 'zod'
 
@@ -26,7 +25,7 @@ const PromptToDXFSchema = z.object({
   use_ai_enhancement: z.boolean().optional()
 })
 
-// Herramientas del agente
+// TODAS las herramientas completas del agente
 const arkCuttTools = {
   // 1. Análisis de archivo DXF
   analyzeDXF: tool({
@@ -34,6 +33,8 @@ const arkCuttTools = {
     parameters: DXFAnalysisSchema,
     execute: async ({ file_content, filename }) => {
       try {
+        console.log(`[ArkCutt] Analizando archivo DXF: ${filename}`)
+        
         // Convertir el contenido base64 a un Blob para el FormData
         const binaryString = atob(file_content)
         const bytes = new Uint8Array(binaryString.length)
@@ -64,7 +65,7 @@ const arkCuttTools = {
           }
         }
 
-        return {
+        const result = {
           success: true,
           data: {
             // Información de estadísticas
@@ -93,54 +94,65 @@ const arkCuttTools = {
                        analysis.statistics.total_entities > 100 ? 'media' : 'baja'
           }
         }
+        
+        console.log(`[ArkCutt] Análisis completado:`, result.data)
+        return result
       } catch (error) {
+        console.error(`[ArkCutt] Error analizando DXF:`, error)
         return {
           success: false,
           error: 'Error analizando el archivo DXF',
-          details: error.message
+          details: (error instanceof Error ? error.message : String(error))
         }
       }
     }
   }),
 
-  // 2. Consulta de materiales disponibles
+  // 2. Consulta de materiales disponibles (LOCAL - respaldo)
   getMaterialOptions: tool({
-    description: 'Consulta los materiales disponibles y sus precios basado en los datos de inventario',
+    description: 'Consulta los materiales disponibles y sus precios basado en los datos de inventario local',
     parameters: z.object({
       categoria: z.enum(['madera', 'plastico', 'papel', 'todos']).optional(),
       grosor_min: z.string().optional(),
       grosor_max: z.string().optional()
     }),
     execute: async ({ categoria, grosor_min, grosor_max }) => {
-      // Aquí usarías los datos del CSV que proporcionaste
+      console.log(`[ArkCutt] Consultando materiales locales: ${categoria || 'todos'}`)
+      
+      // Datos del CSV que proporcionaste
       const materiales = [
         {
-          id: 6,
-          nombre: "DM",
-          categoria: "madera",
-          grosores: ["2.5"],
-          color: "Madera Natural",
-          precio_por_cm2: 0.008,
-          stock_actual: 0
+          id: 6, nombre: "DM", categoria: "madera", grosores: ["2.5"], 
+          color: "Madera Natural", precio_por_cm2: 0.008
         },
         {
-          id: 19,
-          nombre: "METACRILATO",
-          categoria: "plastico", 
-          grosores: ["2"],
-          color: "Transparente",
-          precio_por_cm2: 0.051,
-          stock_actual: 0
+          id: 7, nombre: "DM", categoria: "madera", grosores: ["3"], 
+          color: "Madera Natural", precio_por_cm2: 0.010
+        },
+        {
+          id: 8, nombre: "DM", categoria: "madera", grosores: ["4"], 
+          color: "Madera Natural", precio_por_cm2: 0.019
+        },
+        {
+          id: 19, nombre: "METACRILATO", categoria: "plastico", grosores: ["2"], 
+          color: "Transparente", precio_por_cm2: 0.051
+        },
+        {
+          id: 20, nombre: "METACRILATO", categoria: "plastico", grosores: ["3"], 
+          color: "Transparente", precio_por_cm2: 0.063
+        },
+        {
+          id: 12, nombre: "CONTRACHAPADO", categoria: "madera", grosores: ["4"], 
+          color: "Madera clara", precio_por_cm2: 0.030
         }
-        // ... más materiales del CSV
       ]
 
       const filteredMaterials = materiales.filter(m => {
         if (categoria && categoria !== 'todos' && m.categoria !== categoria) return false
-        // Lógica adicional de filtrado por grosor
         return true
       })
 
+      console.log(`[ArkCutt] Materiales encontrados:`, filteredMaterials.length)
       return {
         success: true,
         materials: filteredMaterials,
@@ -149,7 +161,128 @@ const arkCuttTools = {
     }
   }),
 
-  // 3. Calcular presupuesto (REQUIERE análisis DXF previo)
+  // 3. Consultar materiales desde backend (PRINCIPAL)
+  getMaterialsFromBackend: tool({
+    description: 'Consulta los materiales disponibles directamente desde el backend de presupuestos (más actualizado)',
+    parameters: z.object({}), // No requiere parámetros
+    execute: async () => {
+      try {
+        console.log(`[ArkCutt] Consultando materiales desde backend...`)
+        
+        const response = await fetch('https://calculadora-presupuestos-laser.onrender.com/materiales', {
+          method: 'GET',
+          headers: {
+            'Content-Type': 'application/json'
+          }
+        })
+
+        if (!response.ok) {
+          throw new Error(`HTTP error! status: ${response.status}`)
+        }
+
+        const result = await response.json()
+
+        console.log(`[ArkCutt] Materiales del backend:`, result.total)
+        return {
+          success: true,
+          data: {
+            materiales: result.materiales,
+            detalle: result.detalle,
+            total: result.total
+          }
+        }
+      } catch (error) {
+        console.error(`[ArkCutt] Error consultando materiales del backend:`, error)
+        return {
+          success: false,
+          error: 'Error consultando materiales del backend',
+          details: (error instanceof Error ? error.message : String(error))
+        }
+      }
+    }
+  }),
+
+  // 4. Generar DXF desde prompt
+  generateDXFFromPrompt: tool({
+    description: 'Genera un archivo DXF a partir de una descripción textual usando IA',
+    parameters: z.object({
+      prompt: z.string().min(3).max(500).describe('Descripción del objeto a crear'),
+      width: z.number().min(0).max(3000).optional().describe('Ancho en milímetros'),
+      height: z.number().min(0).max(3000).optional().describe('Alto en milímetros'), 
+      depth: z.number().min(0).max(3000).optional().describe('Profundidad en milímetros'),
+      material: z.enum(['wood', 'acrylic', 'mdf', 'cardboard', 'metal', 'paper']).optional().describe('Tipo de material'),
+      use_ai_enhancement: z.boolean().optional().default(true).describe('Usar IA para mejorar interpretación')
+    }),
+    execute: async ({ prompt, width, height, depth, material, use_ai_enhancement = true }) => {
+      try {
+        console.log(`[ArkCutt] Generando DXF: ${prompt}`)
+        
+        const requestBody: {
+          prompt: string;
+          use_ai_enhancement: boolean;
+          dimensions?: { width?: number; height?: number; depth?: number };
+          material?: 'wood' | 'acrylic' | 'mdf' | 'cardboard' | 'metal' | 'paper';
+        } = {
+          prompt,
+          use_ai_enhancement
+        }
+
+        // Agregar dimensiones si se proporcionan
+        if (width || height || depth) {
+          requestBody.dimensions = {}
+          if (width) requestBody.dimensions.width = width
+          if (height) requestBody.dimensions.height = height  
+          if (depth) requestBody.dimensions.depth = depth
+        }
+
+        // Agregar material si se proporciona
+        if (material) {
+          requestBody.material = material
+        }
+
+        const response = await fetch('https://backend-dxf.onrender.com/api/v1/generate', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify(requestBody)
+        })
+
+        if (!response.ok) {
+          throw new Error(`HTTP error! status: ${response.status}`)
+        }
+
+        const result = await response.json()
+
+        if (!result.success) {
+          return {
+            success: false,
+            error: result.message || 'Error en la generación del DXF'
+          }
+        }
+
+        console.log(`[ArkCutt] DXF generado:`, result.filename)
+        return {
+          success: true,
+          data: {
+            filename: result.filename,
+            download_url: result.download_url,
+            metadata: result.metadata,
+            message: result.message
+          }
+        }
+      } catch (error) {
+        console.error(`[ArkCutt] Error generando DXF:`, error)
+        return {
+          success: false,
+          error: 'Error generando el archivo DXF',
+          details: (error instanceof Error ? error.message : String(error))
+        }
+      }
+    }
+  }),
+
+  // 5. Calcular presupuesto (REQUIERE análisis DXF previo)
   calculateQuote: tool({
     description: 'Calcula el presupuesto completo basado en el análisis DXF y datos del cliente. SOLO se puede usar después de analyzeDXF.',
     parameters: z.object({
@@ -186,6 +319,8 @@ const arkCuttTools = {
       complexity
     }) => {
       try {
+        console.log(`[ArkCutt] Calculando presupuesto para: ${cliente_nombre}`)
+        
         const requestBody = {
           "Cliente": {
             "Nombre y Apellidos": cliente_nombre,
@@ -244,6 +379,7 @@ const arkCuttTools = {
           }
         }
 
+        console.log(`[ArkCutt] Presupuesto calculado: €${result.data.total}`)
         return {
           success: true,
           data: {
@@ -270,124 +406,17 @@ const arkCuttTools = {
           }
         }
       } catch (error) {
+        console.error(`[ArkCutt] Error calculando presupuesto:`, error)
         return {
           success: false,
           error: 'Error calculando el presupuesto',
-          details: error.message
+          details: (error instanceof Error ? error.message : String(error))
         }
       }
     }
   }),
 
-  // 6. Consultar materiales disponibles desde el backend
-  getMaterialsFromBackend: tool({
-    description: 'Consulta los materiales disponibles directamente desde el backend de presupuestos',
-    parameters: z.object({}), // No requiere parámetros
-    execute: async () => {
-      try {
-        const response = await fetch('https://calculadora-presupuestos-laser.onrender.com/materiales', {
-          method: 'GET',
-          headers: {
-            'Content-Type': 'application/json'
-          }
-        })
-
-        if (!response.ok) {
-          throw new Error(`HTTP error! status: ${response.status}`)
-        }
-
-        const result = await response.json()
-
-        return {
-          success: true,
-          data: {
-            materiales: result.materiales,
-            detalle: result.detalle,
-            total: result.total
-          }
-        }
-      } catch (error) {
-        return {
-          success: false,
-          error: 'Error consultando materiales del backend',
-          details: error.message
-        }
-      }
-    }
-  }),
-
-  // 4. Generar DXF desde prompt
-  generateDXFFromPrompt: tool({
-    description: 'Genera un archivo DXF a partir de una descripción textual usando IA',
-    parameters: z.object({
-      prompt: z.string().min(3).max(500).describe('Descripción del objeto a crear'),
-      width: z.number().min(0).max(3000).optional().describe('Ancho en milímetros'),
-      height: z.number().min(0).max(3000).optional().describe('Alto en milímetros'), 
-      depth: z.number().min(0).max(3000).optional().describe('Profundidad en milímetros'),
-      material: z.enum(['wood', 'acrylic', 'mdf', 'cardboard', 'metal', 'paper']).optional().describe('Tipo de material'),
-      use_ai_enhancement: z.boolean().optional().default(true).describe('Usar IA para mejorar interpretación')
-    }),
-    execute: async ({ prompt, width, height, depth, material, use_ai_enhancement = true }) => {
-      try {
-        const requestBody = {
-          prompt,
-          use_ai_enhancement
-        }
-
-        // Agregar dimensiones si se proporcionan
-        if (width || height || depth) {
-          requestBody.dimensions = {}
-          if (width) requestBody.dimensions.width = width
-          if (height) requestBody.dimensions.height = height  
-          if (depth) requestBody.dimensions.depth = depth
-        }
-
-        // Agregar material si se proporciona
-        if (material) {
-          requestBody.material = material
-        }
-
-        const response = await fetch('https://backend-dxf.onrender.com/api/v1/generate', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify(requestBody)
-        })
-
-        if (!response.ok) {
-          throw new Error(`HTTP error! status: ${response.status}`)
-        }
-
-        const result = await response.json()
-
-        if (!result.success) {
-          return {
-            success: false,
-            error: result.message || 'Error en la generación del DXF'
-          }
-        }
-
-        return {
-          success: true,
-          data: {
-            filename: result.filename,
-            download_url: result.download_url,
-            metadata: result.metadata,
-            message: result.message
-          }
-        }
-      } catch (error) {
-        return {
-          success: false,
-          error: 'Error generando el archivo DXF',
-          details: error.message
-        }
-      }
-    }
-  }),
-
-  // 5. Obtener información de entrega
+  // 6. Obtener información de entrega
   getDeliveryInfo: tool({
     description: 'Consulta opciones y tiempos de entrega disponibles',
     parameters: z.object({
@@ -395,17 +424,19 @@ const arkCuttTools = {
       urgencia: z.enum(['normal', 'express', 'urgente']).optional()
     }),
     execute: async ({ codigo_postal, urgencia = 'normal' }) => {
-      // Simulated delivery logic
+      console.log(`[ArkCutt] Consultando información de entrega: ${urgencia}`)
+      
+      // Lógica de entrega simulada
       const deliveryOptions = [
         {
           type: 'normal',
-          days: 3-5,
+          days: '3-5',
           cost: 5.99,
           description: 'Entrega estándar'
         },
         {
           type: 'express', 
-          days: 1-2,
+          days: '1-2',
           cost: 12.99,
           description: 'Entrega express'
         }
@@ -414,14 +445,19 @@ const arkCuttTools = {
       return {
         success: true,
         options: deliveryOptions,
-        estimated_date: new Date(Date.now() + (urgencia === 'express' ? 2 : 5) * 24 * 60 * 60 * 1000)
+        estimated_date: new Date(Date.now() + (urgencia === 'express' ? 2 : 5) * 24 * 60 * 60 * 1000),
+        codigo_postal_consultado: codigo_postal
       }
     }
   })
 }
 
 export async function POST(req: Request) {
+  try {
+    console.log(`[ArkCutt] Nueva solicitud de chat recibida`)
+    
   const { messages } = await req.json()
+    console.log(`[ArkCutt] Procesando ${messages.length} mensajes`)
 
   const result = await streamText({
     model: openai('gpt-4o'),
@@ -443,21 +479,30 @@ export async function POST(req: Request) {
     WORKFLOW OBLIGATORIO PARA PRESUPUESTOS:
     1. Usuario sube archivo DXF → EJECUTAR analyzeDXF automáticamente
     2. Mostrar resultados del análisis (área, dimensiones, longitud de corte)
-    3. Consultar materiales disponibles con getMaterialsFromBackend
+    3. Consultar materiales disponibles con getMaterialsFromBackend (principal) o getMaterialOptions (respaldo)
     4. Pedir al usuario: material, grosor, color + datos personales (nombre, email, teléfono)
     5. EJECUTAR calculateQuote con TODOS los datos del análisis DXF + selección del usuario
     6. Mostrar presupuesto completo y detallado
 
     FLUJOS ALTERNATIVOS:
-    - Si usuario describe un objeto → generateDXFFromPrompt (para generar DXF, NO para presupuesto)
+    - Si usuario describe un objeto → generateDXFFromPrompt (para generar DXF, NO para presupuesto directo)
     - Si consulta general → responder directamente sin herramientas
-    - Si pregunta por materiales → getMaterialsFromBackend
+    - Si pregunta por materiales → getMaterialsFromBackend o getMaterialOptions
+    - Si pregunta por entrega → getDeliveryInfo
 
     DATOS CRÍTICOS DEL ANÁLISIS DXF (para presupuestos):
     - area_mm2: Área total del proyecto
     - cut_length.total_m: Longitud de corte exterior
     - total_entities: Número de elementos
     - complexity: Calculada según entidades y phantoms
+
+    HERRAMIENTAS DISPONIBLES:
+    1. analyzeDXF - Analizar archivos DXF (OBLIGATORIO para presupuestos)
+    2. getMaterialsFromBackend - Materiales actualizados del backend
+    3. getMaterialOptions - Materiales locales (respaldo)
+    4. generateDXFFromPrompt - Generar DXF desde descripción
+    5. calculateQuote - Calcular presupuesto (requiere análisis DXF previo)
+    6. getDeliveryInfo - Información de entrega
 
     IMPORTANTE:
     - NUNCA calcules presupuesto sin análisis DXF previo
@@ -471,28 +516,27 @@ export async function POST(req: Request) {
     - Técnicamente preciso
     - Paciente al explicar el proceso paso a paso
     `,
+      
     tools: arkCuttTools,
-    stopWhen: [
-      // Para cuando se complete un presupuesto completo (análisis DXF + presupuesto)
-      (toolCalls, toolResults) => {
-        const hasDXFAnalysis = toolResults.some(result => 
-          result.toolName === 'analyzeDXF' && result.result.success
-        )
-        const hasQuote = toolResults.some(result => 
-          result.toolName === 'calculateQuote' && result.result.success
-        )
-        // Solo se detiene cuando tiene AMBOS: análisis DXF Y presupuesto
-        return hasDXFAnalysis && hasQuote
-      },
-      // Para evitar loops infinitos
-      stepCountIs(6)
-    ],
-    maxSteps: 6,
-    onFinish: ({ finishReason, totalUsage, steps }) => {
-      console.log('Agent finished:', { finishReason, totalUsage, steps: steps.length })
+    onFinish: ({ finishReason, steps }) => {
+        console.log(`[ArkCutt] Chat finalizado:`, { finishReason, steps: steps?.length })
     }
   })
 
+    console.log(`[ArkCutt] Respuesta generada exitosamente`)
   return result.toDataStreamResponse()
-}
 
+  } catch (error) {
+    console.error(`[ArkCutt] Error en el endpoint de chat:`, error)
+    return new Response(
+      JSON.stringify({ 
+        error: 'Error interno del servidor ArkCutt', 
+        details: (error instanceof Error ? error.message : String(error)) 
+      }),
+      { 
+        status: 500, 
+        headers: { 'Content-Type': 'application/json' } 
+      }
+    )
+  }
+}
